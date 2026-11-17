@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import {
   Activity, ArrowDown, ArrowDownUp, ArrowLeft, ArrowRight, ArrowUpRight, Bell, CalendarDays, Check, CheckCheck,
   ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clock3, Command, Download, Ellipsis, FileText, Filter,
   Flame, FolderKanban, Grid2X2, Inbox, LayoutDashboard, ListTodo, Menu, MessageCircle, MoreHorizontal,
-  Plus, Search, Settings, Sparkles, Target, X, Zap, type LucideIcon
+  Plus, Search, Settings, Sparkles, Target, X, Zap, Github, LogOut, Mail, LockKeyhole, LoaderCircle, type LucideIcon
 } from 'lucide-react'
+import type { Session } from '@supabase/supabase-js'
+import { supabase, supabaseConfigured } from './lib/supabase'
 
 type Priority = 'High' | 'Medium' | 'Low'
 type Task = { id: string; title: string; project: string; due: string; priority: Priority; done: boolean; initials: string; color: string; description?: string }
@@ -39,9 +41,16 @@ const dateLabel = (iso: string) => {
   return d.toLocaleDateString('en-US',{month:'short',day:'numeric'})
 }
 const storedTasks = (): Task[] => { try { const v=localStorage.getItem('kenny.tasks.v1'); return v?JSON.parse(v):seedTasks } catch { return seedTasks } }
+const mapDbTask=(row:{id:string;title:string;project:string;due_date:string;priority:Priority;is_done:boolean;description?:string|null}):Task=>({
+  id:row.id,title:row.title,project:row.project,due:row.due_date,priority:row.priority,done:row.is_done,
+  initials:'ME',color:projects.find(p=>p.name===row.project)?.color==='orange'?'peach':projects.find(p=>p.name===row.project)?.color==='green'?'mint':projects.find(p=>p.name===row.project)?.color==='blue'?'blue':'lavender',description:row.description||undefined,
+})
 
 function App() {
   const [tasks,setTasks]=useState<Task[]>(storedTasks)
+  const [session,setSession]=useState<Session|null>(null)
+  const [authLoading,setAuthLoading]=useState(supabaseConfigured)
+  const [tasksLoading,setTasksLoading]=useState(false)
   const [active,setActive]=useState<View>('Overview')
   const [filter,setFilter]=useState('All tasks')
   const [query,setQuery]=useState('')
@@ -52,7 +61,46 @@ function App() {
   const [mobileNav,setMobileNav]=useState(false)
   const [calendarMonth,setCalendarMonth]=useState(new Date())
   const searchRef=useRef<HTMLInputElement>(null)
-  useEffect(()=>{ localStorage.setItem('kenny.tasks.v1',JSON.stringify(tasks)) },[tasks])
+  const userId=session?.user.id
+  const userEmail=session?.user.email||''
+  const userName=(session?.user.user_metadata?.full_name as string|undefined)?.split(' ')[0]||userEmail.split('@')[0]||'Alex'
+  const userInitials=userName.slice(0,2).toUpperCase()
+  useEffect(()=>{
+    if(!supabase) return
+    let mounted=true
+    const {data:{subscription}}=supabase.auth.onAuthStateChange((_event,nextSession)=>{
+      setSession(nextSession)
+      setAuthLoading(false)
+    })
+    supabase.auth.getSession().then(({data,error})=>{
+      if(!mounted) return
+      if(error) showToast('Could not restore your sign-in. Please sign in again.')
+      setSession(data.session)
+      setAuthLoading(false)
+    })
+    return ()=>{mounted=false;subscription.unsubscribe()}
+  },[])
+  useEffect(()=>{
+    if(!supabaseConfigured){localStorage.setItem('kenny.tasks.v1',JSON.stringify(tasks));return}
+    if(!userId||!supabase) return
+    let cancelled=false
+    setTasksLoading(true)
+    const load=async()=>{
+      const {data,error}=await supabase!.from('kenny_tasks').select('*').order('due_date',{ascending:true})
+      if(error) throw error
+      let rows=data||[]
+      if(rows.length===0){
+        const initials=(userEmail.split('@')[0]||'you').slice(0,2).toUpperCase()
+        const payload=seedTasks.map(({title,project,due,priority,done,description})=>({owner_id:userId,title,project,due_date:due,priority,is_done:done,description:description||null,initials}))
+        const seeded=await supabase!.from('kenny_tasks').insert(payload).select('*')
+        if(seeded.error) throw seeded.error
+        rows=seeded.data||[]
+      }
+      if(!cancelled) setTasks(rows.map(mapDbTask))
+    }
+    load().catch(error=>{console.error('Unable to load Kenny tasks',error);if(!cancelled)showToast('Could not load tasks from your workspace.')}).finally(()=>{if(!cancelled)setTasksLoading(false)})
+    return ()=>{cancelled=true}
+  },[userId])
   useEffect(()=>{ const fn=(e:KeyboardEvent)=>{ if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();searchRef.current?.focus()} if(e.key==='Escape'){setModal(false);setNotifications(false)} }; window.addEventListener('keydown',fn); return ()=>window.removeEventListener('keydown',fn) },[])
   const done=tasks.filter(t=>t.done).length
   const visibleTasks=useMemo(()=>tasks.filter(t=>{
@@ -61,13 +109,31 @@ function App() {
     return matches&&status
   }),[tasks,query,filter])
   const todayTasks=tasks.filter(t=>!t.done&&t.due<=dateAt(0))
-  const toggleTask=(id:string)=>setTasks(cur=>cur.map(t=>t.id===id?{...t,done:!t.done}:t))
   const showToast=(msg:string)=>{setToast(msg);window.setTimeout(()=>setToast(''),2600)}
-  const addTask=(data:{title:string;project:string;due:string;priority:Priority})=>{
-    setTasks(cur=>[{...data,id:`t${Date.now()}`,done:false,initials:'YO',color:'lavender'},...cur]);setModal(false);showToast('Task added to your workspace')
+  const toggleTask=(id:string)=>{
+    const task=tasks.find(t=>t.id===id)
+    if(!task) return
+    const done=!task.done
+    if(supabase&&userId){
+      void supabase.from('kenny_tasks').update({is_done:done,updated_at:new Date().toISOString()}).eq('id',id).then(({error})=>{
+        if(error){showToast('Could not update this task. Try again.');return}
+        setTasks(cur=>cur.map(t=>t.id===id?{...t,done}:t))
+      })
+    }else setTasks(cur=>cur.map(t=>t.id===id?{...t,done}:t))
+  }
+  const addTask=async(data:{title:string;project:string;due:string;priority:Priority})=>{
+    if(supabase&&userId){
+      const {data:row,error}=await supabase.from('kenny_tasks').insert({owner_id:userId,title:data.title,project:data.project,due_date:data.due,priority:data.priority,is_done:false}).select('*').single()
+      if(error){showToast('Could not save this task. Please try again.');return}
+      setTasks(cur=>[mapDbTask(row),...cur])
+    }else setTasks(cur=>[{...data,id:`t${Date.now()}`,done:false,initials:'YO',color:'lavender'},...cur])
+    setModal(false);showToast('Task added to your workspace')
   }
   const selectNav=(v:View)=>{setActive(v);setMobileNav(false);if(v==='Inbox')setInboxUnread(false)}
   const exportTasks=()=>{const blob=new Blob([JSON.stringify(tasks,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='kenny-tasks.json';a.click();URL.revokeObjectURL(a.href);showToast('Your workspace export is ready')}
+  if(supabaseConfigured&&authLoading) return <AuthLoading/>
+  if(supabaseConfigured&&!session) return <AuthScreen/>
+  if(supabaseConfigured&&tasksLoading) return <AuthLoading message="Loading your workspace…"/>
   return <div className="app-shell">
     <aside className={`sidebar ${mobileNav?'mobile-open':''}`}>
       <div className="brand"><div className="brand-mark"><span>k</span></div><span className="brand-name">kenny</span><button className="sidebar-collapse icon-button" aria-label="Collapse sidebar"><ArrowDownUp size={16}/></button></div>
@@ -78,13 +144,13 @@ function App() {
       </nav>
       <div className="side-label project-label">YOUR PROJECTS <button className="tiny-add" onClick={()=>showToast('Project creation is coming soon')} aria-label="Add project"><Plus size={14}/></button></div>
       <div className="project-nav">{projects.slice(0,4).map(p=><button className="project-link" key={p.name} onClick={()=>selectNav('Projects')}><span className={`project-dot ${p.color}`}/><span>{p.name}</span></button>)}</div>
-      <div className="sidebar-bottom"><div className="upgrade-card"><div className="upgrade-spark"><Sparkles size={16}/></div><strong>Make room for more</strong><p>Unlock unlimited projects and make your best work happen.</p><button onClick={()=>showToast('You are already on the list!')}>Explore plans <ArrowUpRight size={14}/></button></div><button className="nav-item settings-link" onClick={()=>showToast('Settings are looking good as they are')}><Settings size={18}/><span>Settings</span></button><button className="nav-item help-link" onClick={()=>showToast('We’re here if you need us')}><CircleHelp size={18}/><span>Help & feedback</span></button><div className="user-profile"><div className="user-avatar">AM<span/></div><span className="user-copy"><strong>Alex Morgan</strong><small>Personal space</small></span><MoreHorizontal size={19}/></div></div>
+      <div className="sidebar-bottom"><div className="upgrade-card"><div className="upgrade-spark"><Sparkles size={16}/></div><strong>Make room for more</strong><p>Unlock unlimited projects and make your best work happen.</p><button onClick={()=>showToast('You are already on the list!')}>Explore plans <ArrowUpRight size={14}/></button></div><button className="nav-item settings-link" onClick={()=>showToast('Settings are looking good as they are')}><Settings size={18}/><span>Settings</span></button><button className="nav-item help-link" onClick={()=>showToast('We’re here if you need us')}><CircleHelp size={18}/><span>Help & feedback</span></button><div className="user-profile"><div className="user-avatar">{userInitials}<span/></div><span className="user-copy"><strong>{userName}</strong><small>{userEmail||'Personal space'}</small></span>{supabaseConfigured?<button className="signout-button" onClick={()=>void supabase?.auth.signOut()} title="Sign out" aria-label="Sign out"><LogOut size={15}/></button>:<MoreHorizontal size={19}/>}</div></div>
     </aside>
     <main className="main-area">
-      <header className="topbar"><button className="mobile-menu icon-button" onClick={()=>setMobileNav(!mobileNav)} aria-label="Open menu"><Menu size={20}/></button><div className="breadcrumb">Workspace <ChevronRight size={14}/><strong>{active}</strong></div><div className="top-actions"><div className="search-wrap"><Search size={16}/><input ref={searchRef} aria-label="Search your workspace" placeholder="Search anything..." value={query} onChange={e=>setQuery(e.target.value)}/><kbd><Command size={11}/> K</kbd></div><button className="icon-button notification-btn" aria-label="Notifications" onClick={()=>setNotifications(!notifications)}><Bell size={18}/><i/></button><div className="top-avatar">AM</div>{notifications&&<div className="notification-pop"><div className="pop-heading"><strong>Notifications</strong><button onClick={()=>setNotifications(false)}><X size={15}/></button></div><div className="notification-item"><span className="notification-icon"><MessageCircle size={15}/></span><div><b>Jamie left a comment</b><small>“Looks great, thanks!” · 12m ago</small></div></div><div className="notification-item"><span className="notification-icon green-icon"><Check size={15}/></span><div><b>Website redesign is moving</b><small>3 tasks completed · 1h ago</small></div></div><button className="see-all" onClick={()=>{setNotifications(false);selectNav('Inbox')}}>See all activity <ArrowRight size={14}/></button></div>}</div></header>
+      <header className="topbar"><button className="mobile-menu icon-button" onClick={()=>setMobileNav(!mobileNav)} aria-label="Open menu"><Menu size={20}/></button><div className="breadcrumb">Workspace <ChevronRight size={14}/><strong>{active}</strong></div><div className="top-actions"><div className="search-wrap"><Search size={16}/><input ref={searchRef} aria-label="Search your workspace" placeholder="Search anything..." value={query} onChange={e=>setQuery(e.target.value)}/><kbd><Command size={11}/> K</kbd></div><button className="icon-button notification-btn" aria-label="Notifications" onClick={()=>setNotifications(!notifications)}><Bell size={18}/><i/></button><div className="top-avatar">{userInitials}</div>{notifications&&<div className="notification-pop"><div className="pop-heading"><strong>Notifications</strong><button onClick={()=>setNotifications(false)}><X size={15}/></button></div><div className="notification-item"><span className="notification-icon"><MessageCircle size={15}/></span><div><b>Jamie left a comment</b><small>“Looks great, thanks!” · 12m ago</small></div></div><div className="notification-item"><span className="notification-icon green-icon"><Check size={15}/></span><div><b>Website redesign is moving</b><small>3 tasks completed · 1h ago</small></div></div><button className="see-all" onClick={()=>{setNotifications(false);selectNav('Inbox')}}>See all activity <ArrowRight size={14}/></button></div>}</div></header>
       <div className="page-content">
         {active==='Overview'&&<>
-          <div className="welcome-row"><div><div className="eyebrow"><span className="live-dot"/> TUESDAY, {new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}).toUpperCase()}</div><h1>Good morning, Alex <span className="wave">✦</span></h1><p className="subtitle">A little progress each day adds up to big results.</p></div><button className="primary-button" onClick={()=>setModal(true)}><Plus size={17}/> New task</button></div>
+          <div className="welcome-row"><div><div className="eyebrow"><span className="live-dot"/> TUESDAY, {new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}).toUpperCase()}</div><h1>Good morning, {userName} <span className="wave">✦</span></h1><p className="subtitle">A little progress each day adds up to big results.</p></div><button className="primary-button" onClick={()=>setModal(true)}><Plus size={17}/> New task</button></div>
           <div className="overview-grid"><section className="focus-card"><div className="focus-head"><div><span className="card-kicker">YOUR FOCUS</span><h2>Make today count</h2></div><span className="focus-icon"><Flame size={18}/></span></div><p className="focus-desc">You have <strong>{todayTasks.length} {todayTasks.length===1?'priority':'priorities'}</strong> to take care of today. You're doing great.</p><div className="focus-progress-row"><div className="avatar-stack"><span className="mini-avatar m1">AM</span><span className="mini-avatar m2">JD</span><span className="mini-avatar m3">SK</span><span className="avatar-more">+2</span></div><span className="focus-small">Team momentum <b>+18%</b></span></div><div className="focus-bottom"><span><Zap size={14}/> {done} tasks completed this week</span><span className="mini-arrow">↗</span></div></section>
             <section className="stat-card"><div className="stat-top"><span>Tasks completed</span><span className="stat-icon purple-stat"><CheckCheck size={17}/></span></div><div className="stat-value">{done}<span> / {tasks.length}</span></div><div className="stat-foot"><div className="tiny-bars">{[30,52,42,64,44,78,58,90,65,82,58,100].map((h,i)=><i key={i} style={{height:`${h}%`}} className={i===11?'bar-current':''}/>)}</div><span className="trend"><ArrowUpRight size={13}/> 24%</span></div><small className="stat-caption">Compared to last week</small></section>
             <section className="stat-card"><div className="stat-top"><span>On-time delivery</span><span className="stat-icon green-stat"><Target size={17}/></span></div><div className="stat-value">94<span>%</span></div><div className="stat-foot"><div className="on-time-track"><i/></div><span className="trend">+8.2%</span></div><small className="stat-caption">You’re on a great streak</small></section>
@@ -118,6 +184,53 @@ function ProjectsPage({onAdd,onOpenTask}:{onAdd:()=>void;onOpenTask:()=>void}){r
 function CalendarPage({month,setMonth,tasks,onAdd}:{month:Date;setMonth:(d:Date)=>void;tasks:Task[];onAdd:()=>void}){const year=month.getFullYear(),m=month.getMonth(),first=new Date(year,m,1).getDay(),daysIn=new Date(year,m+1,0).getDate(),offset=(first+6)%7;const cells=Array.from({length:42},(_,i)=>i-offset+1);const label=month.toLocaleDateString('en-US',{month:'long',year:'numeric'});return <div className="subpage"><div className="subpage-head"><div><span className="section-eyebrow">MAKE SPACE FOR WHAT MATTERS</span><h1>Calendar</h1><p className="subtitle">A gentle rhythm for all the things you're doing.</p></div><button className="primary-button" onClick={onAdd}><Plus size={17}/> New task</button></div><div className="calendar-panel panel"><div className="calendar-toolbar"><div><button className="calendar-arrow" onClick={()=>setMonth(new Date(year,m-1,1))}><ChevronLeft size={17}/></button><button className="calendar-arrow" onClick={()=>setMonth(new Date(year,m+1,1))}><ChevronRight size={17}/></button><strong>{label}</strong></div><button className="outline-button" onClick={()=>setMonth(new Date())}>Today</button></div><div className="calendar-grid">{['MON','TUE','WED','THU','FRI','SAT','SUN'].map(x=><div className="calendar-dayname" key={x}>{x}</div>)}{cells.map((d,i)=>{const activeDay=d>0&&d<=daysIn, iso=activeDay?`${year}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`:'';const dayTasks=tasks.filter(t=>t.due===iso);return <div className={`calendar-cell ${!activeDay?'muted-cell':''} ${activeDay&&iso===dateAt(0)?'today-cell':''}`} key={i}><span className="calendar-number">{activeDay?d:d<=0?new Date(year,m,0).getDate()+d:d-daysIn}</span>{dayTasks.slice(0,2).map(t=><div className={`calendar-event ${projects.find(p=>p.name===t.project)?.color||'purple'} ${t.done?'event-done':''}`} key={t.id}>{t.title}</div>)}</div>})}</div></div></div>}
 function InsightsPage({tasks,done}:{tasks:Task[];done:number}){return <div className="subpage"><div className="subpage-head"><div><span className="section-eyebrow">CELEBRATE YOUR PROGRESS</span><h1>Insights</h1><p className="subtitle">A little perspective on how far you've come.</p></div><div className="insight-pill"><span className="live-dot"/> LAST 7 DAYS</div></div><div className="insights-grid"><div className="insight-card"><span>COMPLETED THIS WEEK</span><b>{done+12}</b><small className="positive-text"><ArrowUpRight size={13}/> 24% vs last week</small></div><div className="insight-card"><span>ON-TIME DELIVERY</span><b>94<span>%</span></b><small className="positive-text"><ArrowUpRight size={13}/> 8.2% vs last month</small></div><div className="insight-card"><span>AVERAGE FOCUS</span><b>3.6<small>h/day</small></b><small>That's 48 minutes more a day</small></div><div className="panel insight-chart-panel"><div className="panel-heading"><div><span className="section-eyebrow">WEEKLY OUTPUT</span><h2>You're finding your rhythm</h2></div><span className="positive-chip">+18%</span></div><ActivityChart/></div><div className="panel insight-tip"><span className="tip-icon"><Sparkles size={18}/></span><div><strong>Small wins are adding up.</strong><p>You’ve completed {done} tasks in your workspace. Keep protecting your focus time — consistency beats intensity every time.</p></div></div><div className="panel insight-breakdown"><div className="panel-heading"><div><span className="section-eyebrow">A LOOK AT THE WORK</span><h2>Task breakdown</h2></div><span className="breakdown-total">{tasks.length} total</span></div>{[['Completed',done,'purple'],['In progress',tasks.filter(t=>!t.done).length,'green'],['High priority',tasks.filter(t=>t.priority==='High').length,'orange']].map(([name,n,c])=><div className="breakdown-line" key={String(name)}><span><i className={`project-dot ${c}`}/>{name}</span><b>{n}</b></div>)}</div></div></div>}
 function InboxPage(){return <div className="subpage"><div className="subpage-head"><div><span className="section-eyebrow">ALL CAUGHT UP</span><h1>Your inbox</h1><p className="subtitle">The important little updates, all in one place.</p></div><button className="outline-button" onClick={()=>{}}><CheckCheck size={15}/> Mark all read</button></div><div className="panel inbox-panel"><div className="inbox-date-label">TODAY</div><div className="inbox-item"><div className="inbox-avatar peach">JD</div><div><p><strong>Jamie Davis</strong> commented on <b>Review homepage wireframes</b></p><blockquote>“The new direction feels really clear. I’ve left a couple of small notes in Figma.”</blockquote><small>12 minutes ago · Website redesign</small></div><span className="unread-pill"/></div><div className="inbox-item"><div className="inbox-avatar mint">SK</div><div><p><strong>Sam Kim</strong> completed <b>Share campaign performance report</b></p><small>1 hour ago · Growth campaign</small></div></div><div className="inbox-item"><div className="inbox-avatar blue">ML</div><div><p><strong>Morgan Lee</strong> added you to <b>Collect feedback from beta users</b></p><small>3 hours ago · Mobile app</small></div></div><div className="inbox-date-label older-label">YESTERDAY</div><div className="inbox-item"><div className="inbox-avatar lavender">AM</div><div><p><strong>You</strong> completed <b>Draft customer interview questions</b></p><small>Yesterday at 4:32 PM · Product launch</small></div></div></div></div>}
-function TaskModal({onClose,onSubmit}:{onClose:()=>void;onSubmit:(d:{title:string;project:string;due:string;priority:Priority})=>void}){const [title,setTitle]=useState(''),[project,setProject]=useState(projects[0].name),[due,setDue]=useState(dateAt(1)),[priority,setPriority]=useState<Priority>('Medium');const titleRef=useRef<HTMLInputElement>(null);useEffect(()=>titleRef.current?.focus(),[]);return <div className="modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><form className="task-modal" onSubmit={e=>{e.preventDefault();if(title.trim())onSubmit({title:title.trim(),project,due,priority})}}><div className="modal-top"><div><span className="section-eyebrow">MAKE IT HAPPEN</span><h2>Create a task</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div><label className="form-label">Task name<input ref={titleRef} value={title} onChange={e=>setTitle(e.target.value)} placeholder="What needs to get done?" required maxLength={120}/></label><div className="form-row"><label className="form-label">Project<select value={project} onChange={e=>setProject(e.target.value)}>{projects.map(p=><option key={p.name}>{p.name}</option>)}</select></label><label className="form-label">Due date<input type="date" value={due} onChange={e=>setDue(e.target.value)}/></label></div><fieldset className="priority-field"><legend className="form-label">Priority</legend><div className="priority-options">{(['Low','Medium','High'] as Priority[]).map(p=><button type="button" className={`priority-choice ${priority===p?'chosen':''}`} key={p} onClick={()=>setPriority(p)}><i className={`priority-dot dot-${p.toLowerCase()}`}/>{p}</button>)}</div></fieldset><div className="modal-actions"><button type="button" className="outline-button" onClick={onClose}>Cancel</button><button className="primary-button" type="submit"><Plus size={16}/> Create task</button></div><div className="modal-hint"><Command size={12}/> Your workspace saves automatically</div></form></div>}
+function AuthLoading({message='Getting your workspace ready…'}:{message?:string}){return <div className="auth-loading"><div className="brand-mark"><span>k</span></div><LoaderCircle size={20} className="loading-spinner"/><span>{message}</span></div>}
+
+function AuthScreen(){
+  const [mode,setMode]=useState<'signin'|'signup'>('signin')
+  const [email,setEmail]=useState('')
+  const [password,setPassword]=useState('')
+  const [busy,setBusy]=useState(false)
+  const [message,setMessage]=useState('')
+  const [error,setError]=useState('')
+  const [showPassword,setShowPassword]=useState(false)
+  const submit=async(e:FormEvent)=>{
+    e.preventDefault();if(!supabase)return
+    setBusy(true);setMessage('');setError('')
+    try{
+      if(mode==='signup'){
+        const {data,error}=await supabase.auth.signUp({email:email.trim(),password,options:{emailRedirectTo:window.location.origin}})
+        if(error)throw error
+        if(!data.session)setMessage('Check your email for a confirmation link to finish creating your account.')
+      }else{
+        const {error}=await supabase.auth.signInWithPassword({email:email.trim(),password})
+        if(error)throw error
+      }
+    }catch(err){setError(err instanceof Error?err.message:'Something went wrong. Please try again.')}
+    finally{setBusy(false)}
+  }
+  const github=async()=>{
+    if(!supabase)return
+    setBusy(true);setError('')
+    const {error}=await supabase.auth.signInWithOAuth({provider:'github',options:{redirectTo:window.location.origin}})
+    if(error){setError(error.message);setBusy(false)}
+  }
+  const resetPassword=async()=>{
+    if(!supabase||!email.trim()){setError('Enter your email address first, then choose reset password.');return}
+    setBusy(true);setError('');setMessage('')
+    const {error}=await supabase.auth.resetPasswordForEmail(email.trim(),{redirectTo:window.location.origin})
+    setBusy(false)
+    if(error)setError(error.message);else setMessage('If an account exists for that address, a reset link is on its way.')
+  }
+  return <div className="auth-page"><div className="auth-decoration auth-decoration-one"/><div className="auth-decoration auth-decoration-two"/><header className="auth-brand"><div className="brand-mark"><span>k</span></div><span className="brand-name">kenny</span><span className="auth-brand-caption">YOUR WORKSPACE</span></header><div className="auth-card"><div className="auth-card-top"><span className="auth-spark"><Sparkles size={18}/></span><span className="section-eyebrow">A LITTLE MORE FLOW</span></div><h1>{mode==='signin'?'Welcome back':'Make good work happen'}</h1><p className="auth-subtitle">{mode==='signin'?'Sign in to pick up where you left off.':'Create your account and get your ideas moving.'}</p><button className="github-button" onClick={()=>void github()} disabled={busy}><Github size={17}/> Continue with GitHub</button><div className="auth-divider"><span/>or continue with email<span/></div><form onSubmit={submit} className="auth-form"><label>Email address<span className="auth-input-wrap"><Mail size={15}/><input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="you@example.com" required autoComplete="email"/></span></label><label>Password<span className="auth-input-wrap"><LockKeyhole size={15}/><input type={showPassword?'text':'password'} value={password} onChange={e=>setPassword(e.target.value)} placeholder="At least 8 characters" minLength={8} required autoComplete={mode==='signin'?'current-password':'new-password'}/><button type="button" onClick={()=>setShowPassword(!showPassword)}>{showPassword?'Hide':'Show'}</button></span></label>{message&&<div className="auth-message">{message}</div>}{error&&<div className="auth-error">{error}</div>}<button className="primary-button auth-submit" disabled={busy}>{busy?<><LoaderCircle size={16} className="loading-spinner"/> Please wait…</>:mode==='signin'?'Sign in to Kenny':'Create your account'}<ArrowRight size={15}/></button></form>{mode==='signin'&&<button className="forgot-password" onClick={()=>void resetPassword()} disabled={busy}>Forgot your password?</button>}<div className="auth-switch">{mode==='signin'?"New around here?":"Already have an account?"}<button onClick={()=>{setMode(mode==='signin'?'signup':'signin');setError('');setMessage('')}}>{mode==='signin'?'Create an account':'Sign in'}</button></div></div><div className="auth-footer"><span><i className="live-dot"/> Your work, safe and in sync</span><span>KENNY WORKSPACE · 1.0</span></div></div>
+}
+
+function TaskModal({onClose,onSubmit}:{onClose:()=>void;onSubmit:(d:{title:string;project:string;due:string;priority:Priority})=>Promise<void>}){
+  const [title,setTitle]=useState(''),[project,setProject]=useState(projects[0].name),[due,setDue]=useState(dateAt(1)),[priority,setPriority]=useState<Priority>('Medium'),[saving,setSaving]=useState(false),[formError,setFormError]=useState('')
+  const titleRef=useRef<HTMLInputElement>(null)
+  useEffect(()=>titleRef.current?.focus(),[])
+  const submit=async(e:FormEvent<HTMLFormElement>)=>{e.preventDefault();if(!title.trim()||saving)return;setSaving(true);setFormError('');try{await onSubmit({title:title.trim(),project,due,priority})}catch{setFormError('Could not save this task. Please try again.')}finally{setSaving(false)}}
+  return <div className="modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget&&!saving)onClose()}}><form className="task-modal" onSubmit={submit}><div className="modal-top"><div><span className="section-eyebrow">MAKE IT HAPPEN</span><h2>Create a task</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={18}/></button></div><label className="form-label">Task name<input ref={titleRef} value={title} onChange={e=>setTitle(e.target.value)} placeholder="What needs to get done?" required maxLength={120}/></label><div className="form-row"><label className="form-label">Project<select value={project} onChange={e=>setProject(e.target.value)}>{projects.map(p=><option key={p.name}>{p.name}</option>)}</select></label><label className="form-label">Due date<input type="date" value={due} onChange={e=>setDue(e.target.value)}/></label></div><fieldset className="priority-field"><legend className="form-label">Priority</legend><div className="priority-options">{(['Low','Medium','High'] as Priority[]).map(p=><button type="button" className={`priority-choice ${priority===p?'chosen':''}`} key={p} onClick={()=>setPriority(p)}><i className={`priority-dot dot-${p.toLowerCase()}`}/>{p}</button>)}</div></fieldset>{formError&&<div className="auth-error task-form-error">{formError}</div>}<div className="modal-actions"><button type="button" className="outline-button" onClick={onClose} disabled={saving}>Cancel</button><button className="primary-button" type="submit" disabled={saving}>{saving?<><LoaderCircle size={15} className="loading-spinner"/> Saving…</>:<><Plus size={16}/> Create task</>}</button></div><div className="modal-hint"><Command size={12}/> {supabaseConfigured?'Saved securely to your account':'Your workspace saves automatically'}</div></form></div>
+}
 
 export default App
