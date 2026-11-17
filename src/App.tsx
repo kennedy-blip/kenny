@@ -49,6 +49,7 @@ const mapDbTask=(row:{id:string;title:string;project:string;due_date:string;prio
 function App() {
   const [tasks,setTasks]=useState<Task[]>(storedTasks)
   const [session,setSession]=useState<Session|null>(null)
+  const [recoveryMode,setRecoveryMode]=useState(false)
   const [authLoading,setAuthLoading]=useState(supabaseConfigured)
   const [tasksLoading,setTasksLoading]=useState(false)
   const [active,setActive]=useState<View>('Overview')
@@ -68,7 +69,8 @@ function App() {
   useEffect(()=>{
     if(!supabase) return
     let mounted=true
-    const {data:{subscription}}=supabase.auth.onAuthStateChange((_event,nextSession)=>{
+    const {data:{subscription}}=supabase.auth.onAuthStateChange((event,nextSession)=>{
+      if(event==='PASSWORD_RECOVERY') setRecoveryMode(true)
       setSession(nextSession)
       setAuthLoading(false)
     })
@@ -132,6 +134,7 @@ function App() {
   const selectNav=(v:View)=>{setActive(v);setMobileNav(false);if(v==='Inbox')setInboxUnread(false)}
   const exportTasks=()=>{const blob=new Blob([JSON.stringify(tasks,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='kenny-tasks.json';a.click();URL.revokeObjectURL(a.href);showToast('Your workspace export is ready')}
   if(supabaseConfigured&&authLoading) return <AuthLoading/>
+  if(supabaseConfigured&&recoveryMode) return <PasswordRecovery onDone={()=>setRecoveryMode(false)}/>
   if(supabaseConfigured&&!session) return <AuthScreen/>
   if(supabaseConfigured&&tasksLoading) return <AuthLoading message="Loading your workspace…"/>
   return <div className="app-shell">
@@ -185,6 +188,20 @@ function CalendarPage({month,setMonth,tasks,onAdd}:{month:Date;setMonth:(d:Date)
 function InsightsPage({tasks,done}:{tasks:Task[];done:number}){return <div className="subpage"><div className="subpage-head"><div><span className="section-eyebrow">CELEBRATE YOUR PROGRESS</span><h1>Insights</h1><p className="subtitle">A little perspective on how far you've come.</p></div><div className="insight-pill"><span className="live-dot"/> LAST 7 DAYS</div></div><div className="insights-grid"><div className="insight-card"><span>COMPLETED THIS WEEK</span><b>{done+12}</b><small className="positive-text"><ArrowUpRight size={13}/> 24% vs last week</small></div><div className="insight-card"><span>ON-TIME DELIVERY</span><b>94<span>%</span></b><small className="positive-text"><ArrowUpRight size={13}/> 8.2% vs last month</small></div><div className="insight-card"><span>AVERAGE FOCUS</span><b>3.6<small>h/day</small></b><small>That's 48 minutes more a day</small></div><div className="panel insight-chart-panel"><div className="panel-heading"><div><span className="section-eyebrow">WEEKLY OUTPUT</span><h2>You're finding your rhythm</h2></div><span className="positive-chip">+18%</span></div><ActivityChart/></div><div className="panel insight-tip"><span className="tip-icon"><Sparkles size={18}/></span><div><strong>Small wins are adding up.</strong><p>You’ve completed {done} tasks in your workspace. Keep protecting your focus time — consistency beats intensity every time.</p></div></div><div className="panel insight-breakdown"><div className="panel-heading"><div><span className="section-eyebrow">A LOOK AT THE WORK</span><h2>Task breakdown</h2></div><span className="breakdown-total">{tasks.length} total</span></div>{[['Completed',done,'purple'],['In progress',tasks.filter(t=>!t.done).length,'green'],['High priority',tasks.filter(t=>t.priority==='High').length,'orange']].map(([name,n,c])=><div className="breakdown-line" key={String(name)}><span><i className={`project-dot ${c}`}/>{name}</span><b>{n}</b></div>)}</div></div></div>}
 function InboxPage(){return <div className="subpage"><div className="subpage-head"><div><span className="section-eyebrow">ALL CAUGHT UP</span><h1>Your inbox</h1><p className="subtitle">The important little updates, all in one place.</p></div><button className="outline-button" onClick={()=>{}}><CheckCheck size={15}/> Mark all read</button></div><div className="panel inbox-panel"><div className="inbox-date-label">TODAY</div><div className="inbox-item"><div className="inbox-avatar peach">JD</div><div><p><strong>Jamie Davis</strong> commented on <b>Review homepage wireframes</b></p><blockquote>“The new direction feels really clear. I’ve left a couple of small notes in Figma.”</blockquote><small>12 minutes ago · Website redesign</small></div><span className="unread-pill"/></div><div className="inbox-item"><div className="inbox-avatar mint">SK</div><div><p><strong>Sam Kim</strong> completed <b>Share campaign performance report</b></p><small>1 hour ago · Growth campaign</small></div></div><div className="inbox-item"><div className="inbox-avatar blue">ML</div><div><p><strong>Morgan Lee</strong> added you to <b>Collect feedback from beta users</b></p><small>3 hours ago · Mobile app</small></div></div><div className="inbox-date-label older-label">YESTERDAY</div><div className="inbox-item"><div className="inbox-avatar lavender">AM</div><div><p><strong>You</strong> completed <b>Draft customer interview questions</b></p><small>Yesterday at 4:32 PM · Product launch</small></div></div></div></div>}
 function AuthLoading({message='Getting your workspace ready…'}:{message?:string}){return <div className="auth-loading"><div className="brand-mark"><span>k</span></div><LoaderCircle size={20} className="loading-spinner"/><span>{message}</span></div>}
+
+function PasswordRecovery({onDone}:{onDone:()=>void}){
+  const [password,setPassword]=useState(''),[confirm,setConfirm]=useState(''),[busy,setBusy]=useState(false),[error,setError]=useState(''),[saved,setSaved]=useState(false)
+  const submit=async(e:FormEvent<HTMLFormElement>)=>{
+    e.preventDefault();setError('')
+    if(password!==confirm){setError('Those passwords do not match.');return}
+    if(!supabase)return
+    setBusy(true)
+    const {error}=await supabase.auth.updateUser({password})
+    setBusy(false)
+    if(error)setError(error.message);else setSaved(true)
+  }
+  return <div className="auth-page"><div className="auth-decoration auth-decoration-one"/><header className="auth-brand"><div className="brand-mark"><span>k</span></div><span className="brand-name">kenny</span><span className="auth-brand-caption">YOUR WORKSPACE</span></header><div className="auth-card"><div className="auth-card-top"><span className="auth-spark"><LockKeyhole size={17}/></span><span className="section-eyebrow">ACCOUNT SECURITY</span></div><h1>{saved?'Password updated':'Choose a new password'}</h1><p className="auth-subtitle">{saved?'Your Kenny account is ready to go.':'Use a new password with at least 8 characters.'}</p>{saved?<button className="primary-button auth-submit" onClick={onDone}>Continue to Kenny <ArrowRight size={15}/></button>:<form onSubmit={submit} className="auth-form"><label>New password<span className="auth-input-wrap"><LockKeyhole size={15}/><input type="password" value={password} onChange={e=>setPassword(e.target.value)} minLength={8} autoComplete="new-password" required/></span></label><label>Confirm new password<span className="auth-input-wrap"><LockKeyhole size={15}/><input type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} minLength={8} autoComplete="new-password" required/></span></label>{error&&<div className="auth-error">{error}</div>}<button className="primary-button auth-submit" disabled={busy}>{busy?'Saving…':'Update password'} <ArrowRight size={15}/></button></form>}</div><div className="auth-footer"><span><i className="live-dot"/> Your work, safe and in sync</span><span>KENNY WORKSPACE · 1.0</span></div></div>
+}
 
 function AuthScreen(){
   const [mode,setMode]=useState<'signin'|'signup'>('signin')
